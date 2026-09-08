@@ -3,11 +3,11 @@ import enum
 import logging
 import socket
 
-from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
 import tyro
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+from openpi.serving.websocket_b1k_server import WebsocketPolicyServer
 from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 from openpi.training import config as _config
 

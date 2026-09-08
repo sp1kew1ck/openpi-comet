@@ -2,22 +2,10 @@ import dataclasses
 
 import einops
 import numpy as np
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
 from openpi import transforms
+from openpi.configs.robots.base_config import RobotConfig
 from openpi.models import model as _model
-
-MAX_DEPTH = 10.0
-
-CAMERA_INTRINSICS = {
-    "head": np.array([[306.0, 0.0, 360.0], [0.0, 306.0, 360.0], [0.0, 0.0, 1.0]], dtype=np.float32),  # 720x720
-    "left_wrist": np.array(
-        [[388.6639, 0.0, 240.0], [0.0, 388.6639, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32
-    ),  # 480x480
-    "right_wrist": np.array(
-        [[388.6639, 0.0, 240.0], [0.0, 388.6639, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32
-    ),  # 480x480
-}
 
 
 def make_b1k_example() -> dict:
@@ -31,33 +19,26 @@ def make_b1k_example() -> dict:
     }
 
 
-def extract_state_from_proprio(proprio_data):
-    """
+def extract_state_from_proprio(proprio_data, robot_config: RobotConfig) -> np.ndarray:
+    """Extract state from proprioception data based on robot configuration.
+
     We assume perfect correlation for the two gripper fingers.
+
+    Args:
+        proprio_data: Raw proprioception data
+        robot_config: RobotConfig instance containing robot configuration
+
+    Returns:
+        Extracted state array
     """
-    # extract joint position
-    base_qvel = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]  # 3
-    trunk_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["trunk_qpos"]]  # 4
-    arm_left_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_left_qpos"]]  #  7
-    arm_right_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_right_qpos"]]  #  7
-    left_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_left_qpos"]].sum(
-        axis=-1, keepdims=True
-    )  # 1
-    right_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_right_qpos"]].sum(
-        axis=-1, keepdims=True
-    )  # 1
-    return np.concatenate(
-        [
-            base_qvel,
-            trunk_qpos,
-            arm_left_qpos,
-            # left_gripper_width,
-            arm_right_qpos,
-            left_gripper_width,  # NOTE: we rearrange the gripper from 21 to 14 to match the action space
-            right_gripper_width,
-        ],
-        axis=-1,
-    )
+    state = []
+    for proprio in robot_config.proprio:
+        if proprio.is_eef:
+            # Sum the gripper finger positions to get a single width value
+            state.append(proprio_data[..., proprio.indices].sum(axis=-1, keepdims=True))
+        else:
+            state.append(proprio_data[..., proprio.indices])
+    return np.concatenate(state, axis=-1)
 
 
 def _parse_image(image) -> np.ndarray:
@@ -69,10 +50,9 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
-def _parse_seg_image(image) -> np.ndarray:
-    MAX_SEG = 8
+def _parse_seg_image(image, max_seg=8) -> np.ndarray:
     image = np.asarray(image)
-    image = image / MAX_SEG * 255
+    image = image / max_seg * 255
     image = np.repeat(image[..., np.newaxis], 3, axis=-1)
     return image.astype(np.uint8)
 
@@ -89,8 +69,7 @@ def depth_to_pcd(depth_image: np.ndarray, camera_intrinsics: np.ndarray, downsam
     z = depth_image
     pcd_xyz = np.stack([x, y, z], axis=-1)  # (h, w, 3)
 
-    pcd_xyz = pcd_xyz[::downsample, ::downsample].reshape(16, -1, 3)
-    return pcd_xyz  # (16, 2025, 3)
+    return pcd_xyz[::downsample, ::downsample].reshape(16, -1, 3)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,52 +86,52 @@ class B1kInputs(transforms.DataTransformFn):
 
     pcd_downsample: int = 6
 
+    # Robot configuration object
+    robot_config: RobotConfig = dataclasses.field(default=None)
+
+    # Statistics computation does not need to decode camera frames.
+    include_images: bool = True
+
     def __call__(self, data: dict) -> dict:
         proprio_data = data["observation/state"]
         # extract joint position
-        state = extract_state_from_proprio(proprio_data)
+        state = extract_state_from_proprio(proprio_data, self.robot_config)
         if "actions" in data:
             action = data["actions"]
 
-        # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
-        # stores as float32 (C,H,W), gets skipped for policy inference
-        base_image = _parse_image(data["observation/egocentric_camera"])
-        wrist_image_left = _parse_image(data["observation/wrist_image_left"])
-        wrist_image_right = _parse_image(data["observation/wrist_image_right"])
+        inputs = {"state": state}
 
-        meta_images, meta_image_names = [], []
+        if self.include_images:
+            # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
+            # stores as float32 (C,H,W), gets skipped for policy inference
+            base_image = _parse_image(data["observation/egocentric_camera"])
+            wrist_image_left = _parse_image(data["observation/wrist_image_left"])
+            wrist_image_right = _parse_image(data["observation/wrist_image_right"])
 
-        if self.depth_as_pcd:
-            depth_image = data["observation/egocentric_depth"]
-            pcd_xyz = depth_to_pcd(depth_image, CAMERA_INTRINSICS["head"], self.pcd_downsample)
+            meta_images, meta_image_names = [], []
+            if "observation/egocentric_seg" in self.meta_image_keys:
+                seg_image = _parse_seg_image(data["observation/egocentric_seg"])
+                meta_images.append(seg_image)
+                meta_image_names.append("base_0_seg")
 
-        if "observation/egocentric_seg" in self.meta_image_keys:
-            seg_image = _parse_seg_image(data["observation/egocentric_seg"])
-            meta_images.append(seg_image)
-            meta_image_names.append("base_0_seg")
+            match self.model_type:
+                case _model.ModelType.PI0 | _model.ModelType.PI05:
+                    names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                    images = (base_image, wrist_image_left, wrist_image_right)
+                    image_masks = (np.True_, np.True_, np.True_)
+                case _model.ModelType.PI0_FAST:
+                    names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
+                    # We don't mask out padding images for FAST models.
+                    images = (base_image, wrist_image_left, wrist_image_right)
+                    image_masks = (np.True_, np.True_, np.True_)
+                case _:
+                    raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        match self.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI05:
-                names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                images = (base_image, wrist_image_left, wrist_image_right)
-                image_masks = (np.True_, np.True_, np.True_)
-            case _model.ModelType.PI0_FAST:
-                names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
-                # We don't mask out padding images for FAST models.
-                images = (base_image, wrist_image_left, wrist_image_right)
-                image_masks = (np.True_, np.True_, np.True_)
-            case _:
-                raise ValueError(f"Unsupported model type: {self.model_type}")
-
-        names += tuple(meta_image_names)
-        images += tuple(meta_images)
-        image_masks += tuple(np.True_ for _ in meta_image_names)
-
-        inputs = {
-            "state": state,
-            "image": dict(zip(names, images, strict=True)),
-            "image_mask": dict(zip(names, image_masks, strict=True)),
-        }
+            names += tuple(meta_image_names)
+            images += tuple(meta_images)
+            image_masks += tuple(np.True_ for _ in meta_image_names)
+            inputs["image"] = dict(zip(names, images, strict=True))
+            inputs["image_mask"] = dict(zip(names, image_masks, strict=True))
 
         if "actions" in data:
             inputs["actions"] = action
@@ -161,7 +140,9 @@ class B1kInputs(transforms.DataTransformFn):
             inputs["prompt"] = data["prompt"]
 
         if self.depth_as_pcd:
-            inputs["pcd_xyz"] = pcd_xyz
+            depth_image = data["observation/egocentric_depth"]
+            inputs["pcd_xyz"] = depth_to_pcd(depth_image, self.robot_config.camera_intrinsics["head"], self.pcd_downsample)
+
         return inputs
 
 

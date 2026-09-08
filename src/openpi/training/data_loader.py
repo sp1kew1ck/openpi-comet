@@ -7,6 +7,7 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -46,6 +47,33 @@ class DataLoader(Protocol[T_co]):
 
     def __iter__(self) -> Iterator[T_co]:
         raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
+
+
+class StateActionDataset(Dataset[dict]):
+    """Read only the columns required for normalization statistics."""
+
+    def __init__(self, dataset, columns: Sequence[str]):
+        self._dataset = dataset
+        self._columns = [key for key in columns if key in dataset.features]
+        missing = set(columns) - set(self._columns)
+        if missing:
+            raise KeyError(f"Normalization columns are missing from the dataset: {sorted(missing)}")
+        self._dataset.hf_dataset = self._dataset.hf_dataset.select_columns(self._columns)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        index = index.__index__()
+        item = self._dataset.hf_dataset[index]
+        ep_idx = item["episode_index"].item()
+
+        if self._dataset.delta_indices is not None:
+            query_indices, padding = self._dataset._get_query_indices(index, ep_idx)
+            item.update(padding)
+            item.update(self._dataset._query_hf_dataset(query_indices))
+
+        return item
+
+    def __len__(self) -> int:
+        return len(self._dataset)
 
 
 class TransformedDataset(Dataset[T_co]):
@@ -125,45 +153,81 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
-    """Create a dataset for training."""
-    from behavior.learning.datas.dataset import BehaviorLeRobotDataset
+def create_torch_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    load_visual_data: bool = True,
+    stats_columns: Sequence[str] | None = None,
+) -> Dataset:
+    """Create a LeRobot dataset for training."""
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+    if repo_id == "fake":
+        return FakeDataset(model_config, num_samples=1024)
 
-    args = {}
-
-    if data_config.skill_list != ["all"]:
-        args["skill_list"] = data_config.skill_list
-
-    dataset = BehaviorLeRobotDataset(
-        repo_id=data_config.repo_id,
-        root=data_config.behavior_dataset_root,
-        tolerance_s=data_config.tolerance_s,
-        tasks=data_config.tasks,
-        modalities=data_config.modalities,
-        local_only=True,
-        delta_timestamps={key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys},
+    # Use local root when behavior_dataset_root is set (B1K datasets stored locally).
+    root = data_config.behavior_dataset_root or None
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        root=root,
         episodes=data_config.episodes_index,
-        chunk_streaming_using_keyframe=True,
-        shuffle=True,
-        fine_grained_level=data_config.fine_grained_level,
-        return_seg_instance=data_config.return_seg_instance,
-        train_rgb_type=data_config.train_rgb_type,
-        **args,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
     )
 
-    # fixed prompt hard coding
-    dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
+    if not load_visual_data:
+        if stats_columns is None:
+            raise ValueError("stats_columns must be set when load_visual_data is False")
+        dataset = StateActionDataset(dataset, stats_columns)
+
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 
 
-def create_multi_behavior_dataset(
-    data_configs: list[_config.DataConfig], sample_weights: list[float] | None, action_horizon: int
-) -> Dataset:
-    from behavior.learning.datas.dataset import MultiBehaviorLeRobotDataset
+def create_rlds_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    *,
+    shuffle: bool = False,
+) -> IterableDataset:
+    """Create an RLDS dataset for training (currently only supports DROID).
 
-    datasets = [create_behavior_dataset(data_config, action_horizon) for data_config in data_configs]
-    return MultiBehaviorLeRobotDataset(datasets, sample_weights=sample_weights)
+    Requires the optional droid_rlds_dataset module and its dependencies (tensorflow, dlimp, etc.).
+    """
+    from openpi.training.droid_rlds_dataset import DroidActionSpace as _DroidActionSpace
+    from openpi.training.droid_rlds_dataset import DroidRldsDataset, RLDSDataset
+
+    # Map the config enum to droid_rlds_dataset's enum by name so the two definitions stay independent.
+    action_space = None
+    if data_config.action_space is not None:
+        action_space = _DroidActionSpace[data_config.action_space.name]
+
+    # Build a single dataset entry from the DataConfig fields.
+    datasets = [
+        RLDSDataset(
+            name=data_config.repo_id or "droid",
+            version="1.0.1",
+            weight=1.0,
+            filter_dict_path=data_config.filter_dict_path,
+        )
+    ]
+
+    return DroidRldsDataset(
+        data_dir=data_config.rlds_data_dir,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        action_chunk_size=action_horizon,
+        action_space=action_space,
+        datasets=datasets,
+    )
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -217,106 +281,6 @@ def transform_iterable_dataset(
     )
 
 
-def create_behavior_data_loader(
-    config: _config.TrainConfig,
-    *,
-    sharding: jax.sharding.Sharding | None = None,
-    shuffle: bool = False,
-    num_batches: int | None = None,
-    skip_norm_stats: bool = False,
-    seed_shift: int = 0,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    if isinstance(config.data, list):
-        data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
-        dataset = create_multi_behavior_dataset(
-            data_configs,
-            sample_weights=config.sample_weights,
-            action_horizon=config.model.action_horizon,
-        )
-        data_config = data_configs[0]
-    else:
-        data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
-
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
-
-    data_loader = TorchDataLoader(
-        dataset,
-        local_batch_size=config.batch_size // jax.process_count(),
-        sharding=sharding,
-        shuffle=shuffle,
-        num_batches=num_batches,
-        num_workers=config.num_workers,
-        seed=config.seed + seed_shift,
-    )
-
-    return DataLoaderImpl(data_config, data_loader)
-
-
-def create_torch_behavior_data_loader(
-    config: _config.TrainConfig,
-    action_horizon: int,
-    batch_size: int,
-    *,
-    skip_norm_stats: bool = False,
-    shuffle: bool = False,
-    num_workers: int = 0,
-    seed: int = 0,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
-
-    Args:
-        data_config: The data configuration.
-        action_horizon: The action horizon.
-        batch_size: The batch size.
-        skip_norm_stats: Whether to skip data normalization.
-        shuffle: Whether to shuffle the data.
-        num_workers: The number of worker processes to use. If zero, the data loader will
-            execute in the main process.
-        seed: The seed to use for shuffling the data.
-    """
-    if isinstance(config.data, list):
-        data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
-        dataset = create_multi_behavior_dataset(
-            data_configs,
-            sample_weights=config.sample_weights,
-            action_horizon=config.model.action_horizon,
-        )
-        data_config = data_configs[0]
-    else:
-        data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
-
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
-
-    sampler = None
-    if torch.distributed.is_initialized():
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
-            shuffle=shuffle,
-            drop_last=True,
-        )
-        local_batch_size = batch_size // torch.distributed.get_world_size()
-    else:
-        local_batch_size = batch_size
-
-    logging.info(f"local_batch_size: {local_batch_size}")
-    data_loader = TorchDataLoader(
-        dataset,
-        local_batch_size=local_batch_size,
-        sharding=None,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-        sampler=sampler,
-        num_workers=num_workers,
-        seed=seed,
-        framework="pytorch",
-    )
-
-    return DataLoaderImpl(data_config, data_loader)
-
-
 class TorchDataLoader:
     """Torch data loader implementation."""
 
@@ -348,33 +312,8 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        from behavior.learning.datas.dataset import MultiBehaviorLeRobotDataset
-
         if jax.process_count() > 1:
-            logging.info(f"Subsetting dataset for process {jax.process_index()}.")
-            if isinstance(dataset._dataset, MultiBehaviorLeRobotDataset):
-                for dataset_index in range(len(dataset._dataset.datasets)):
-                    indices = list(
-                        range(
-                            jax.process_index(),
-                            len(dataset._dataset.datasets[dataset_index]._dataset.chunks),
-                            jax.process_count(),
-                        )
-                    )
-                    dataset._dataset.datasets[dataset_index]._dataset.chunks = [
-                        dataset._dataset.datasets[dataset_index]._dataset.chunks[i] for i in indices
-                    ]
-                total_chunks = sum(
-                    len(dataset._dataset.datasets[dataset_index]._dataset.chunks)
-                    for dataset_index in range(len(dataset._dataset.datasets))
-                )
-                logging.info(f"[P{jax.process_index()}] After subset, Dataset has {total_chunks} chunks.")
-            else:
-                indices = list(range(jax.process_index(), len(dataset._dataset._dataset.chunks), jax.process_count()))
-                dataset._dataset._dataset.chunks = [dataset._dataset._dataset.chunks[i] for i in indices]
-                logging.info(
-                    f"[P{jax.process_index()}] After subset, Dataset has {len(dataset._dataset._dataset.chunks)} chunks."
-                )
+            raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
@@ -393,7 +332,7 @@ class TorchDataLoader:
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
-        # For multi-process JAX training, each process should have a different seed
+        # Use a process-index-dependent seed so each JAX process draws different samples.
         process_seed = seed + jax.process_index()
         generator = torch.Generator()
         generator.manual_seed(process_seed)
@@ -450,8 +389,51 @@ def _worker_init_fn(worker_id: int) -> None:
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 
+class RLDSDataLoader:
+    """Shallow wrapper around the DROID data loader to make it compatible with openpi.
+
+    All batching already happens in the DROID dataset, so we don't need to do anything here.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        *,
+        sharding: jax.sharding.Sharding | None = None,
+        num_batches: int | None = None,
+    ):
+        self._dataset = dataset
+        self._num_batches = num_batches
+
+        if jax.process_count() > 1:
+            raise NotImplementedError("Data loading with multiple processes is not supported.")
+
+        if sharding is None:
+            # Use data parallel sharding by default.
+            sharding = jax.sharding.NamedSharding(
+                jax.sharding.Mesh(jax.devices(), ("B",)),
+                jax.sharding.PartitionSpec("B"),
+            )
+
+        self._sharding = sharding
+
+    def __iter__(self):
+        num_items = 0
+        while True:
+            data_iter = iter(self._dataset)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                num_items += 1
+                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+
+
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
         self._data_config = data_config
         self._data_loader = data_loader
 

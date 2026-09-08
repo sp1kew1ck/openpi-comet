@@ -5,11 +5,14 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+
 import numpy as np
 import tqdm
 import tyro
 
 import openpi.models.model as _model
+import openpi.policies.b1k_policy as _b1k_policy
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -19,6 +22,38 @@ import openpi.transforms as transforms
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+def _stats_columns(data_config: _config.DataConfig) -> set[str]:
+    columns = {"episode_index"}
+    for transform in data_config.repack_transforms.inputs:
+        if isinstance(transform, transforms.RepackTransform):
+            for key, source in transform.structure.items():
+                if key in {"observation/state", "actions"}:
+                    columns.add(source)
+    if data_config.prompt_from_task:
+        columns.add("task_index")
+    return columns
+
+
+def _stats_input_transforms(data_config: _config.DataConfig) -> list[transforms.DataTransformFn]:
+    """Keep only transforms required to produce state and action statistics."""
+    repack_inputs = []
+    for transform in data_config.repack_transforms.inputs:
+        if isinstance(transform, transforms.RepackTransform):
+            structure = {
+                key: value for key, value in transform.structure.items() if key in {"observation/state", "actions"}
+            }
+            transform = dataclasses.replace(transform, structure=structure)
+        repack_inputs.append(transform)
+
+    data_inputs = []
+    for transform in data_config.data_transforms.inputs:
+        if isinstance(transform, _b1k_policy.B1kInputs):
+            transform = dataclasses.replace(transform, include_images=False, depth_as_pcd=False)
+        data_inputs.append(transform)
+
+    return [*repack_inputs, *data_inputs, RemoveStrings()]
 
 
 def create_torch_dataloader(
@@ -31,16 +66,14 @@ def create_torch_dataloader(
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = _data_loader.TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+    dataset = _data_loader.create_torch_dataset(
+        data_config,
+        action_horizon,
+        model_config,
+        load_visual_data=False,
+        stats_columns=_stats_columns(data_config),
     )
+    dataset = _data_loader.TransformedDataset(dataset, _stats_input_transforms(data_config))
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -66,12 +99,7 @@ def create_rlds_dataloader(
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        _stats_input_transforms(data_config),
         is_batched=True,
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -92,61 +120,28 @@ def main(config_name: str, max_frames: int | None = None):
         data_config = config.data[0].create(config.assets_dirs, config.model)
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.behavior_dataset_root:
-        from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
-
-        from openpi.policies.b1k_policy import extract_state_from_proprio
-
-        metadata = BehaviorLerobotDatasetMetadata(
-            repo_id=data_config.repo_id,
-            root=data_config.behavior_dataset_root,
-            tasks=data_config.tasks,
-            modalities=[],
-            cameras=[],
+    if data_config.rlds_data_dir is not None:
+        data_loader, num_batches = create_rlds_dataloader(
+            data_config, config.model.action_horizon, config.batch_size, max_frames
         )
-        stats = metadata.stats
-        if data_config.episodes_index is not None:
-            from omnigibson.learning.datas import BehaviorLeRobotDataset
-
-            dataset = BehaviorLeRobotDataset(
-                repo_id=data_config.repo_id,
-                root=data_config.behavior_dataset_root,
-                tasks=data_config.tasks,
-                modalities=[],
-                cameras=[],
-                episodes=data_config.episodes_index,
-            )
-            stats = dataset.stats
-
-        norm_stats = {"state": {}, "actions": {}}
-        for key in ["mean", "std", "q01", "q99"]:
-            norm_stats["state"][key] = transforms.pad_to_dim(
-                extract_state_from_proprio(stats["observation.state"][key]), config.model.action_dim
-            )
-            norm_stats["actions"][key] = transforms.pad_to_dim(stats["action"][key], config.model.action_dim)
     else:
-        if data_config.rlds_data_dir is not None:
-            data_loader, num_batches = create_rlds_dataloader(
-                data_config, config.model.action_horizon, config.batch_size, max_frames
-            )
-        else:
-            data_loader, num_batches = create_torch_dataloader(
-                data_config,
-                config.model.action_horizon,
-                config.batch_size,
-                config.model,
-                config.num_workers,
-                max_frames,
-            )
+        data_loader, num_batches = create_torch_dataloader(
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
+        )
 
-        keys = ["state", "actions"]
-        stats = {key: normalize.RunningStats() for key in keys}
+    keys = ["state", "actions"]
+    stats = {key: normalize.RunningStats() for key in keys}
 
-        for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-            for key in keys:
-                stats[key].update(np.asarray(batch[key]))
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        for key in keys:
+            stats[key].update(np.asarray(batch[key]))
 
-        norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")

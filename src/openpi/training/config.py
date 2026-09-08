@@ -18,6 +18,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.b1k_policy as b1k_policy
+from openpi.configs.robots.b1k import R1Pro
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -306,7 +307,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, robot_config=R1Pro)],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
         )
 
@@ -384,6 +385,7 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
                     meta_image_keys=self.meta_image_keys,
                     depth_as_pcd=self.depth_as_pcd,
                     pcd_downsample=self.pcd_downsample,
+                    robot_config=R1Pro,
                 )
             ],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
@@ -459,6 +461,7 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
                     meta_image_keys=self.meta_image_keys,
                     depth_as_pcd=self.depth_as_pcd,
                     pcd_downsample=self.pcd_downsample,
+                    robot_config=R1Pro,
                 )
             ],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
@@ -833,6 +836,34 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=1e-6,
             decay_steps=20_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    # 5. openpi-comet finetune from `pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k`
+    TrainConfig(
+        name="pi05_b1k-pt50_cs32",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/Datasets/behavior-1k/2026-challenge-demos",
+                fine_grained_level=0,  # 0, 1, 2
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/Datasets/Opensource_pretrained_models/robomoma/openpi_comet/pi05-b1kpt50-cs32/params"),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,

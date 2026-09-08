@@ -246,11 +246,10 @@ class B1KPolicyWrapper:
         if self.control_mode == "receeding_temporal":
             return self.act_receeding_temporal(input_obs)
 
-        if self.control_mode == "receeding_horizon":
-            if len(self.action_queue) > 0:
-                # pop the first action in the queue
-                final_action = self.action_queue.popleft()[None]
-                return torch.from_numpy(final_action)
+        if self.control_mode == "receeding_horizon" and len(self.action_queue) > 0:
+            # pop the first action in the queue
+            final_action = self.action_queue.popleft()[None]
+            return torch.from_numpy(final_action)
 
         nbatch = copy.deepcopy(input_obs)
         if nbatch["observation"].shape[-1] != 3:

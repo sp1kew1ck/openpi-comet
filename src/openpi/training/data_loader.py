@@ -153,6 +153,27 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def tasks_to_mapping(tasks) -> dict[int, str]:
+    """Normalize LeRobot task metadata into a {task_index: task name} mapping.
+
+    Older LeRobot versions expose tasks as a dict, while newer ones (>= 0.4) store
+    ``meta/tasks.parquet`` as a pandas DataFrame whose task names are either a "task"
+    column or the index, alongside the "task_index" column.
+    """
+    if isinstance(tasks, dict):
+        return {int(index): str(task) for index, task in tasks.items()}
+    import pandas as pd
+
+    if isinstance(tasks, pd.DataFrame):
+        if tasks.index.name == "task":
+            tasks = tasks.reset_index()
+        if "task" in tasks.columns:
+            return {int(row["task_index"]): str(row["task"]) for _, row in tasks.iterrows()}
+        # Task names live in the (unnamed) DataFrame index.
+        return {int(row["task_index"]): str(task) for task, row in tasks.iterrows()}
+    raise TypeError(f"Unsupported tasks metadata type: {type(tasks)}")
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -186,7 +207,9 @@ def create_torch_dataset(
         dataset = StateActionDataset(dataset, stats_columns)
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(tasks_to_mapping(dataset_meta.tasks))]
+        )
 
     return dataset
 

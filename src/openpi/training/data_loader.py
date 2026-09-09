@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -54,7 +55,9 @@ class StateActionDataset(Dataset[dict]):
 
     def __init__(self, dataset, columns: Sequence[str]):
         self._dataset = dataset
-        self._columns = [key for key in columns if key in dataset.features]
+        # Absolute frame indices are required to compute delta windows correctly.
+        requested = [*columns, "index"] if "index" in dataset.features else list(columns)
+        self._columns = [key for key in requested if key in dataset.features]
         missing = set(columns) - set(self._columns)
         if missing:
             raise KeyError(f"Normalization columns are missing from the dataset: {sorted(missing)}")
@@ -66,7 +69,12 @@ class StateActionDataset(Dataset[dict]):
         ep_idx = item["episode_index"].item()
 
         if self._dataset.delta_indices is not None:
-            query_indices, padding = self._dataset._get_query_indices(index, ep_idx)
+            # Delta windows live in the absolute frame-index space (see
+            # LeRobotDataset.__getitem__), not in the loader's positional space. Using
+            # the positional index here silently returns degenerate windows whenever the
+            # loaded episodes do not start at the beginning of the dataset.
+            abs_idx = item["index"].item() if "index" in item else index
+            query_indices, padding = self._dataset._get_query_indices(abs_idx, ep_idx)
             item.update(padding)
             item.update(self._dataset._query_hf_dataset(query_indices))
 
@@ -174,6 +182,111 @@ def tasks_to_mapping(tasks) -> dict[int, str]:
     raise TypeError(f"Unsupported tasks metadata type: {type(tasks)}")
 
 
+class _ValueIndexedEpisodes:
+    """Episodes metadata addressed by ``episode_index`` *value*, not by row position.
+
+    LeRobot >= 0.4 indexes ``meta.episodes[episode_index]`` positionally, which only
+    holds when episodes are numbered 0..N-1 in row order. Datasets built as subsets of a
+    larger dataset (e.g. scripts/build_b1k_subset.py) keep the source numbering, so
+    their rows are not addressable by their own ``episode_index``. This wrapper leaves
+    the original rows untouched and redirects integer lookups (and the ``len()`` bound
+    used by LeRobot's guards) to the value space.
+    """
+
+    def __init__(self, table):
+        self._table = table
+        self._position = {int(index): i for i, index in enumerate(table["episode_index"])}
+
+    def __getitem__(self, index):
+        return self._table[self._position[int(index)]]
+
+    def __len__(self) -> int:
+        # LeRobot validates episode indices with `ep_index >= len(episodes)`.
+        return max(self._position) + 1 if self._position else 0
+
+    def __getattr__(self, name):
+        # Delegate only regular public attributes to the underlying table. Never resolve
+        # private/dunder names through it: pickle probes for e.g. `__setstate__` while
+        # restoring a bare instance (created via __new__, before `_table` exists), and an
+        # unguarded delegation used to recurse infinitely through `self._table`.
+        if name.startswith("_"):
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+        table = self.__dict__.get("_table")
+        if table is None:
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+        return getattr(table, name)
+
+
+@contextlib.contextmanager
+def _local_dataset_guards(root):
+    """LeRobot may silently fall back to hub downloads whenever a local check fails.
+
+    For local (read-only) dataset roots that is never desired, so fail fast instead.
+    While active, metadata episodes tables are also wrapped to be addressable by value,
+    which is a no-op for canonical (0..N-1) datasets.
+    """
+    if root is None:
+        yield
+        return
+    previous_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    original_load_episodes = lerobot_dataset.load_episodes
+
+    def load_episodes(local_dir):
+        episodes = original_load_episodes(local_dir)
+        try:
+            indices = [int(i) for i in episodes["episode_index"]]
+        except (AttributeError, KeyError, TypeError):
+            return episodes  # Not a columnar episodes table: nothing to align.
+        if indices != list(range(len(episodes))):
+            episodes = _ValueIndexedEpisodes(episodes)
+        return episodes
+
+    lerobot_dataset.load_episodes = load_episodes
+    try:
+        yield
+    finally:
+        lerobot_dataset.load_episodes = original_load_episodes
+        if previous_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous_offline
+
+
+def _resolve_episodes(dataset_meta, data_config: _config.DataConfig) -> list[int]:
+    """Episodes to load, expressed in the dataset's own numbering.
+
+    ``episodes_index`` selects explicitly; otherwise all episodes present in the
+    metadata are returned. Passing ``None`` to LeRobot would request ``0..total-1``,
+    which breaks datasets whose numbering is not row aligned (B1K subsets built by
+    scripts/build_b1k_subset.py preserve the source episode numbering).
+
+    When ``tasks`` (task names) is set, only episodes of these tasks are kept.
+    """
+    if data_config.episodes_index is None:
+        episodes = sorted(int(i) for i in dataset_meta.episodes["episode_index"])
+    else:
+        episodes = sorted(int(i) for i in data_config.episodes_index)
+    if not data_config.tasks:
+        return episodes
+    name_to_index = {name: index for index, name in tasks_to_mapping(dataset_meta.tasks).items()}
+    unknown = sorted(set(data_config.tasks) - set(name_to_index))
+    if unknown:
+        raise ValueError(f"Tasks not found in dataset: {unknown}")
+    table = dataset_meta.episodes
+    if "task_index" not in (getattr(table, "column_names", None) or ()):
+        raise ValueError("Cannot filter by tasks: dataset episodes have no 'task_index' column")
+    task_indices = {name_to_index[name] for name in data_config.tasks}
+    task_episodes = {
+        int(i) for i, t in zip(table["episode_index"], table["task_index"]) if int(t) in task_indices
+    }
+    episodes = sorted(set(episodes) & task_episodes)
+    if not episodes:
+        raise ValueError(f"No episodes found for tasks {data_config.tasks}")
+    logging.info("Filtered episodes to %d for tasks %s", len(episodes), sorted(task_indices))
+    return episodes
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -192,14 +305,17 @@ def create_torch_dataset(
     # Use local root when behavior_dataset_root is set (B1K datasets stored locally).
     root = data_config.behavior_dataset_root or None
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        root=root,
-        episodes=data_config.episodes_index,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    episodes = _resolve_episodes(dataset_meta, data_config)
+
+    with _local_dataset_guards(root):
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            root=root,
+            episodes=episodes,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+        )
 
     if not load_visual_data:
         if stats_columns is None:
@@ -302,6 +418,90 @@ def transform_iterable_dataset(
         ],
         is_batched=is_batched,
     )
+
+
+def _create_behavior_dataset(
+    config: _config.TrainConfig,
+) -> tuple[Dataset, _config.DataConfig]:
+    """Build the (possibly multi-config) raw torch dataset for a training config."""
+    if isinstance(config.data, list):
+        if config.sample_weights and any(w != config.sample_weights[0] for w in config.sample_weights[1:]):
+            raise NotImplementedError(
+                "Non-uniform sample_weights require the legacy omnigibson MultiBehaviorLeRobotDataset."
+            )
+        data_configs = [data.create(config.assets_dirs, config.model) for data in config.data]
+        datasets = [create_torch_dataset(dc, config.model.action_horizon, config.model) for dc in data_configs]
+        return torch.utils.data.ConcatDataset(datasets), data_configs[0]
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    return dataset, data_config
+
+
+def create_behavior_data_loader(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+    seed_shift: int = 0,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a data loader for training (single- or multi-config)."""
+    dataset, data_config = _create_behavior_dataset(config)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed + seed_shift,
+    )
+    return DataLoaderImpl(data_config, data_loader)
+
+
+def create_torch_behavior_data_loader(
+    config: _config.TrainConfig,
+    action_horizon: int,
+    batch_size: int,
+    *,
+    skip_norm_stats: bool = False,
+    shuffle: bool = False,
+    num_workers: int = 0,
+    seed: int = 0,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a PyTorch-framework data loader for training."""
+    if config.model.action_horizon != action_horizon:
+        raise ValueError(f"action_horizon {action_horizon} != model action_horizon {config.model.action_horizon}")
+    dataset, data_config = _create_behavior_dataset(config)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    sampler = None
+    if torch.distributed.is_initialized():
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
+            shuffle=shuffle,
+            drop_last=True,
+        )
+        local_batch_size = batch_size // torch.distributed.get_world_size()
+    else:
+        local_batch_size = batch_size
+
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None,
+        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        sampler=sampler,
+        num_workers=num_workers,
+        seed=seed,
+        framework="pytorch",
+    )
+    return DataLoaderImpl(data_config, data_loader)
 
 
 class TorchDataLoader:

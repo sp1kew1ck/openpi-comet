@@ -854,8 +854,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2026-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=True,
-                episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/Datasets/behavior-1k/2026-challenge-demos",
+                behavior_dataset_root="/home/guolong/dev/VLAM/datasets/b1k_3tasks",
                 fine_grained_level=0,  # 0, 1, 2
             ),
         ),
